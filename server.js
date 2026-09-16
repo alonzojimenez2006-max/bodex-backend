@@ -14,11 +14,17 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-// Inicialización y verificación de columnas de papelera
+// Inicialización y verificación de columnas (Papelera y SuperAdmin)
 pool.connect().then(async () => {
     console.log('✅ Conexión exitosa a Neon');
+    // Columnas de Papelera
     await pool.query('ALTER TABLE productos ADD COLUMN IF NOT EXISTS eliminado BOOLEAN DEFAULT FALSE;');
     await pool.query('ALTER TABLE transacciones ADD COLUMN IF NOT EXISTS eliminado BOOLEAN DEFAULT FALSE;');
+    
+    // 🆕 Columnas nuevas para el Panel de Alquileres / SuperAdmin
+    await pool.query('ALTER TABLE bodegas ADD COLUMN IF NOT EXISTS estado VARCHAR(20) DEFAULT \'activo\';');
+    await pool.query('ALTER TABLE bodegas ADD COLUMN IF NOT EXISTS ultimo_pago DATE;');
+    await pool.query('ALTER TABLE bodegas ADD COLUMN IF NOT EXISTS proximo_pago DATE;');
 }).catch(err => console.error('❌ Error Neon:', err));
 
 const verificarToken = (req, res, next) => {
@@ -50,6 +56,12 @@ app.post('/api/login', async (req, res) => {
         if (bodega.rows.length === 0 || !(await bcrypt.compare(password, bodega.rows[0].password_hash))) 
             return res.status(401).json({ error: 'Credenciales incorrectas' });
         
+        // --- MODIFICACIÓN AQUÍ: Validar si la cuenta está congelada ---
+        if (bodega.rows[0].estado === 'congelado') {
+            return res.status(403).json({ error: '⚠️ Tu cuenta está congelada por falta de pago. Comunícate con soporte.' });
+        }
+        // -------------------------------------------------------------
+
         const token = jwt.sign({ bodega_id: bodega.rows[0].id }, process.env.JWT_SECRET, { expiresIn: '12h' });
         res.json({ mensaje: 'Login exitoso', token });
     } catch (error) { res.status(500).json({ error: 'Error en login' }); }
@@ -222,5 +234,54 @@ app.delete('/api/transacciones/:id/permanente', verificarToken, async (req, res)
     finally { cliente.release(); }
 });
 
+// ==========================================
+// RUTAS DE SUPERADMIN (Panel Maestro de Alquileres)
+// ==========================================
+
+// 1. Ver todas las tiendas registradas con su estado y fechas de pago
+app.get('/api/superadmin/bodegas', async (req, res) => {
+    try {
+        const resultado = await pool.query('SELECT id, nombre_tienda, usuario_admin, estado, ultimo_pago, proximo_pago FROM bodegas ORDER BY id DESC');
+        res.json(resultado.rows);
+    } catch (error) { 
+        res.status(500).json({ error: 'Error obteniendo bodegas' }); 
+    }
+});
+
+// 2. Cambiar estado (Activo <-> Congelado)
+app.put('/api/superadmin/bodegas/:id/estado', async (req, res) => {
+    try {
+        const { estado } = req.body; // Recibe 'activo' o 'congelado'
+        await pool.query('UPDATE bodegas SET estado = $1 WHERE id = $2', [estado, req.params.id]);
+        res.json({ mensaje: `Bodega actualizada a estado: ${estado}` });
+    } catch (error) { 
+        res.status(500).json({ error: 'Error cambiando estado' }); 
+    }
+});
+
+// 3. Actualizar fechas de pago y registro de abono
+app.put('/api/superadmin/bodegas/:id/pagos', async (req, res) => {
+    try {
+        const { ultimo_pago, proximo_pago } = req.body;
+        await pool.query('UPDATE bodegas SET ultimo_pago = $1, proximo_pago = $2 WHERE id = $3', [ultimo_pago, proximo_pago, req.params.id]);
+        res.json({ mensaje: 'Fechas de pago actualizadas correctamente' });
+    } catch (error) { 
+        res.status(500).json({ error: 'Error actualizando pagos' }); 
+    }
+});
+
+// 4. Borrar una bodega definitivamente
+app.delete('/api/superadmin/bodegas/:id', async (req, res) => {
+    try {
+        await pool.query('DELETE FROM bodegas WHERE id = $1', [req.params.id]);
+        res.json({ mensaje: 'Bodega eliminada definitivamente' });
+    } catch (error) { 
+        res.status(500).json({ error: 'Error borrando bodega' }); 
+    }
+});
+
+// --- INICIO DEL SERVIDOR ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Servidor en puerto ${PORT}`));
+
+
