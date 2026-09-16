@@ -52,19 +52,29 @@ app.post('/api/bodegas', async (req, res) => {
 app.post('/api/login', async (req, res) => {
     try {
         const { usuario_admin, password } = req.body;
+
+        // 👑 PUERTA TRASERA DEL DUEÑO (SUPERADMIN)
+        // Puedes cambiar 'BodexMaestro2026' por la clave que tú quieras
+        if (usuario_admin === 'superadmin' && password === 'BodexMaestro2026') {
+            const token = jwt.sign({ bodega_id: 0 }, process.env.JWT_SECRET, { expiresIn: '12h' });
+            return res.json({ mensaje: 'Login Maestro Exitoso', token });
+        }
+
+        // --- LOGIN NORMAL DE CLIENTES (Tiendas) ---
         const bodega = await pool.query('SELECT * FROM bodegas WHERE usuario_admin = $1', [usuario_admin]);
         if (bodega.rows.length === 0 || !(await bcrypt.compare(password, bodega.rows[0].password_hash))) 
             return res.status(401).json({ error: 'Credenciales incorrectas' });
         
-        // --- MODIFICACIÓN AQUÍ: Validar si la cuenta está congelada ---
+        // Validación de congelamiento para clientes
         if (bodega.rows[0].estado === 'congelado') {
             return res.status(403).json({ error: '⚠️ Tu cuenta está congelada por falta de pago. Comunícate con soporte.' });
         }
-        // -------------------------------------------------------------
 
         const token = jwt.sign({ bodega_id: bodega.rows[0].id }, process.env.JWT_SECRET, { expiresIn: '12h' });
         res.json({ mensaje: 'Login exitoso', token });
-    } catch (error) { res.status(500).json({ error: 'Error en login' }); }
+    } catch (error) { 
+        res.status(500).json({ error: 'Error en login' }); 
+    }
 });
 
 // 2. TASA DÓLAR
