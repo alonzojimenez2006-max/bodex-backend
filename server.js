@@ -138,6 +138,22 @@ app.get('/api/transacciones', verificarToken, async (req, res) => {
     } catch (error) { res.status(500).json({ error: 'Error obteniendo historial' }); }
 });
 
+
+// --- 8. ACTUALIZAR PRODUCTO (Restock y Precios) ---
+app.put('/api/productos/:id', verificarToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { nombre, stock, precio_adquisicion, precio_venta } = req.body;
+        const prodActualizado = await pool.query(
+            'UPDATE productos SET nombre = $1, stock = $2, precio_adquisicion = $3, precio_venta = $4 WHERE id = $5 AND bodega_id = $6 RETURNING *',
+            [nombre, stock, precio_adquisicion, precio_venta, id, req.bodega.bodega_id]
+        );
+        res.json({ mensaje: 'Producto actualizado exitosamente', producto: prodActualizado.rows[0] });
+    } catch (error) { 
+        res.status(500).json({ error: 'Error al actualizar el producto' }); 
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`);
