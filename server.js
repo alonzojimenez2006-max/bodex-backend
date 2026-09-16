@@ -50,6 +50,23 @@ app.post('/api/login', async (req, res) => {
     } catch (error) { res.status(500).json({ error: 'Error en login' }); }
 });
 
+// --- OBTENER LA TASA ACTUAL DE LA TIENDA ---
+app.get('/api/tasa', verificarToken, async (req, res) => {
+    try {
+        const resultado = await pool.query(
+            'SELECT tasa FROM historial_tasas WHERE bodega_id = $1 ORDER BY fecha_hora DESC LIMIT 1',
+            [req.bodega.bodega_id]
+        );
+        if (resultado.rows.length > 0) {
+            res.json({ tasa: resultado.rows[0].tasa });
+        } else {
+            res.json({ tasa: 1 }); // Si no ha definido ninguna, retorna 1 por defecto
+        }
+    } catch (error) {
+        res.status(500).json({ error: 'Error obteniendo la tasa actual' });
+    }
+});
+
 // 2. TASA DÓLAR
 app.post('/api/tasa', verificarToken, async (req, res) => {
     try {
