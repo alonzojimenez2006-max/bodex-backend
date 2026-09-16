@@ -14,7 +14,12 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-pool.connect().then(() => console.log('✅ Conexión exitosa a Neon')).catch(err => console.error('❌ Error Neon:', err));
+// Inicialización y verificación de columnas de papelera
+pool.connect().then(async () => {
+    console.log('✅ Conexión exitosa a Neon');
+    await pool.query('ALTER TABLE productos ADD COLUMN IF NOT EXISTS eliminado BOOLEAN DEFAULT FALSE;');
+    await pool.query('ALTER TABLE transacciones ADD COLUMN IF NOT EXISTS eliminado BOOLEAN DEFAULT FALSE;');
+}).catch(err => console.error('❌ Error Neon:', err));
 
 const verificarToken = (req, res, next) => {
     const token = req.header('Authorization');
@@ -50,23 +55,6 @@ app.post('/api/login', async (req, res) => {
     } catch (error) { res.status(500).json({ error: 'Error en login' }); }
 });
 
-// --- OBTENER LA TASA ACTUAL DE LA TIENDA ---
-app.get('/api/tasa', verificarToken, async (req, res) => {
-    try {
-        const resultado = await pool.query(
-            'SELECT tasa FROM historial_tasas WHERE bodega_id = $1 ORDER BY fecha_hora DESC LIMIT 1',
-            [req.bodega.bodega_id]
-        );
-        if (resultado.rows.length > 0) {
-            res.json({ tasa: resultado.rows[0].tasa });
-        } else {
-            res.json({ tasa: 1 }); // Si no ha definido ninguna, retorna 1 por defecto
-        }
-    } catch (error) {
-        res.status(500).json({ error: 'Error obteniendo la tasa actual' });
-    }
-});
-
 // 2. TASA DÓLAR
 app.post('/api/tasa', verificarToken, async (req, res) => {
     try {
@@ -75,12 +63,19 @@ app.post('/api/tasa', verificarToken, async (req, res) => {
     } catch (error) { res.status(500).json({ error: 'Error en tasa' }); }
 });
 
-// 3. INVENTARIO: CREAR PRODUCTO NUEVO
+app.get('/api/tasa', verificarToken, async (req, res) => {
+    try {
+        const resultado = await pool.query('SELECT tasa FROM historial_tasas WHERE bodega_id = $1 ORDER BY fecha_hora DESC LIMIT 1', [req.bodega.bodega_id]);
+        res.json({ tasa: resultado.rows.length > 0 ? resultado.rows[0].tasa : 1 });
+    } catch (error) { res.status(500).json({ error: 'Error obteniendo tasa' }); }
+});
+
+// 3. INVENTARIO (Solo activos)
 app.post('/api/productos', verificarToken, async (req, res) => {
     try {
         const { codigo, nombre, stock, precio_adquisicion, precio_venta } = req.body;
         const nuevoProd = await pool.query(
-            'INSERT INTO productos (bodega_id, codigo, nombre, stock, precio_adquisicion, precio_venta) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+            'INSERT INTO productos (bodega_id, codigo, nombre, stock, precio_adquisicion, precio_venta, eliminado) VALUES ($1, $2, $3, $4, $5, $6, FALSE) RETURNING *',
             [req.bodega.bodega_id, codigo, nombre, stock, precio_adquisicion, precio_venta]
         );
         res.json({ mensaje: 'Producto creado', producto: nuevoProd.rows[0] });
@@ -89,55 +84,42 @@ app.post('/api/productos', verificarToken, async (req, res) => {
 
 app.get('/api/productos', verificarToken, async (req, res) => {
     try {
-        const productos = await pool.query('SELECT * FROM productos WHERE bodega_id = $1 ORDER BY nombre ASC', [req.bodega.bodega_id]);
+        const productos = await pool.query('SELECT * FROM productos WHERE bodega_id = $1 AND (eliminado = FALSE OR eliminado IS NULL) ORDER BY nombre ASC', [req.bodega.bodega_id]);
         res.json(productos.rows);
     } catch (error) { res.status(500).json({ error: 'Error obteniendo inventario' }); }
 });
 
-// --- 4. NUEVO: MÓDULO INTELIGENTE DE RESTOCK ---
+// RESTOCK & PRECIO
 app.post('/api/restock', verificarToken, async (req, res) => {
     const cliente = await pool.connect();
     try {
-        await cliente.query('BEGIN'); // Transacción segura
+        await cliente.query('BEGIN');
         const { producto_id, cantidad_sumar, precio_adquisicion, precio_venta, tasa_aplicada } = req.body;
         const bodega_id = req.bodega.bodega_id;
 
-        // A. Sumamos la cantidad nueva al stock existente
-        await cliente.query(
-            'UPDATE productos SET stock = stock + $1, precio_adquisicion = $2, precio_venta = $3 WHERE id = $4 AND bodega_id = $5',
-            [cantidad_sumar, precio_adquisicion, precio_venta, producto_id, bodega_id]
-        );
-
-        // B. Calculamos cuánto nos costó esa mercancía y lo registramos como EGRESO
+        await cliente.query('UPDATE productos SET stock = stock + $1, precio_adquisicion = $2, precio_venta = $3 WHERE id = $4 AND bodega_id = $5', [cantidad_sumar, precio_adquisicion, precio_venta, producto_id, bodega_id]);
         const costo_total_usd = cantidad_sumar * precio_adquisicion;
+        
         await cliente.query(
-            `INSERT INTO transacciones (bodega_id, tipo, categoria, monto_usd, tasa_aplicada, forma_pago, descripcion)
-             VALUES ($1, 'Egreso', 'Compra de Mercancía', $2, $3, 'Efectivo', $4)`,
-            [bodega_id, costo_total_usd, tasa_aplicada, `Restock: +${cantidad_sumar} unidades agregadas al inventario.`]
+            `INSERT INTO transacciones (bodega_id, tipo, categoria, monto_usd, tasa_aplicada, forma_pago, descripcion, eliminado)
+             VALUES ($1, 'Egreso', 'Compra de Mercancía', $2, $3, 'Efectivo en Dólares', $4, FALSE)`,
+            [bodega_id, costo_total_usd, tasa_aplicada, `Restock: +${cantidad_sumar} unidades`]
         );
 
         await cliente.query('COMMIT');
-        res.json({ mensaje: 'Restock procesado y gasto registrado en movimientos.' });
-    } catch (error) {
-        await cliente.query('ROLLBACK');
-        res.status(500).json({ error: 'Error procesando el restock.' });
-    } finally {
-        cliente.release();
-    }
+        res.json({ mensaje: 'Restock procesado.' });
+    } catch (error) { await cliente.query('ROLLBACK'); res.status(500).json({ error: 'Error en restock.' }); }
+    finally { cliente.release(); }
 });
 
-// --- 5. NUEVO: CAMBIAR SOLO EL PRECIO ---
 app.put('/api/productos/:id/precio', verificarToken, async (req, res) => {
     try {
-        await pool.query(
-            'UPDATE productos SET precio_venta = $1 WHERE id = $2 AND bodega_id = $3',
-            [req.body.precio_venta, req.params.id, req.bodega.bodega_id]
-        );
-        res.json({ mensaje: 'Precio actualizado correctamente.' });
+        await pool.query('UPDATE productos SET precio_venta = $1 WHERE id = $2 AND bodega_id = $3', [req.body.precio_venta, req.params.id, req.bodega.bodega_id]);
+        res.json({ mensaje: 'Precio actualizado.' });
     } catch (error) { res.status(500).json({ error: 'Error actualizando precio.' }); }
 });
 
-// 6. POS Y MOVIMIENTOS
+// 4. POS Y MOVIMIENTOS (Solo activos)
 app.post('/api/transacciones', verificarToken, async (req, res) => {
     const cliente = await pool.connect();
     try {
@@ -146,7 +128,7 @@ app.post('/api/transacciones', verificarToken, async (req, res) => {
         const bodega_id = req.bodega.bodega_id;
 
         const resTrans = await cliente.query(
-            `INSERT INTO transacciones (bodega_id, tipo, categoria, monto_usd, tasa_aplicada, forma_pago, descripcion) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+            `INSERT INTO transacciones (bodega_id, tipo, categoria, monto_usd, tasa_aplicada, forma_pago, descripcion, eliminado) VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE) RETURNING id`,
             [bodega_id, tipo, categoria, monto_usd, tasa_aplicada, forma_pago, descripcion]
         );
         const transaccion_id = resTrans.rows[0].id;
@@ -158,18 +140,86 @@ app.post('/api/transacciones', verificarToken, async (req, res) => {
             }
         }
         await cliente.query('COMMIT');
-        res.json({ mensaje: 'Venta registrada y stock descontado', transaccion_id });
-    } catch (error) {
-        await cliente.query('ROLLBACK');
-        res.status(500).json({ error: 'Error en venta' });
-    } finally { cliente.release(); }
+        res.json({ mensaje: 'Venta registrada', transaccion_id });
+    } catch (error) { await cliente.query('ROLLBACK'); res.status(500).json({ error: 'Error en venta' }); }
+    finally { cliente.release(); }
 });
 
 app.get('/api/transacciones', verificarToken, async (req, res) => {
     try {
-        const trans = await pool.query('SELECT * FROM transacciones WHERE bodega_id = $1 ORDER BY fecha_hora DESC', [req.bodega.bodega_id]);
+        const trans = await pool.query('SELECT * FROM transacciones WHERE bodega_id = $1 AND (eliminado = FALSE OR eliminado IS NULL) ORDER BY fecha_hora DESC', [req.bodega.bodega_id]);
         res.json(trans.rows);
     } catch (error) { res.status(500).json({ error: 'Error en movimientos' }); }
+});
+
+// DETALLES DE FACTURA / VENTA
+app.get('/api/transacciones/:id/detalles', verificarToken, async (req, res) => {
+    try {
+        const detalles = await pool.query(
+            `SELECT dt.*, p.nombre FROM detalles_transaccion dt JOIN productos p ON dt.producto_id = p.id WHERE dt.transaccion_id = $1`,
+            [req.params.id]
+        );
+        res.json(detalles.rows);
+    } catch (error) { res.status(500).json({ error: 'Error obteniendo detalles de factura' }); }
+});
+
+// --- 5. MÓDULO PAPELERA (PRODUCTOS Y MOVIMIENTOS) ---
+app.get('/api/papelera', verificarToken, async (req, res) => {
+    try {
+        const prodPapelera = await pool.query('SELECT * FROM productos WHERE bodega_id = $1 AND eliminado = TRUE', [req.bodega.bodega_id]);
+        const transPapelera = await pool.query('SELECT * FROM transacciones WHERE bodega_id = $1 AND eliminado = TRUE', [req.bodega.bodega_id]);
+        res.json({ productos: prodPapelera.rows, transacciones: transPapelera.rows });
+    } catch (error) { res.status(500).json({ error: 'Error obteniendo papelera' }); }
+});
+
+// Enviar a papelera
+app.put('/api/productos/:id/papelera', verificarToken, async (req, res) => {
+    try {
+        await pool.query('UPDATE productos SET eliminado = TRUE WHERE id = $1 AND bodega_id = $2', [req.params.id, req.bodega.bodega_id]);
+        res.json({ mensaje: 'Producto enviado a la papelera' });
+    } catch (error) { res.status(500).json({ error: 'Error' }); }
+});
+
+app.put('/api/transacciones/:id/papelera', verificarToken, async (req, res) => {
+    try {
+        await pool.query('UPDATE transacciones SET eliminado = TRUE WHERE id = $1 AND bodega_id = $2', [req.params.id, req.bodega.bodega_id]);
+        res.json({ mensaje: 'Movimiento enviado a la papelera' });
+    } catch (error) { res.status(500).json({ error: 'Error' }); }
+});
+
+// Restaurar
+app.put('/api/productos/:id/restaurar', verificarToken, async (req, res) => {
+    try {
+        await pool.query('UPDATE productos SET eliminado = FALSE WHERE id = $1 AND bodega_id = $2', [req.params.id, req.bodega.bodega_id]);
+        res.json({ mensaje: 'Producto restaurado' });
+    } catch (error) { res.status(500).json({ error: 'Error' }); }
+});
+
+app.put('/api/transacciones/:id/restaurar', verificarToken, async (req, res) => {
+    try {
+        await pool.query('UPDATE transacciones SET eliminado = FALSE WHERE id = $1 AND bodega_id = $2', [req.params.id, req.bodega.bodega_id]);
+        res.json({ mensaje: 'Movimiento restaurado' });
+    } catch (error) { res.status(500).json({ error: 'Error' }); }
+});
+
+// Borrar Permanentemente
+app.delete('/api/productos/:id/permanente', verificarToken, async (req, res) => {
+    try {
+        await pool.query('DELETE FROM productos WHERE id = $1 AND bodega_id = $2', [req.params.id, req.bodega.bodega_id]);
+        res.json({ mensaje: 'Producto borrado permanentemente' });
+    } catch (error) { res.status(500).json({ error: 'Error' }); }
+});
+
+app.delete('/api/transacciones/:id/permanente', verificarToken, async (req, res) => {
+    const cliente = await pool.connect();
+    try {
+        await cliente.query('BEGIN');
+        await cliente.query('DELETE FROM detalles_transaccion WHERE transaccion_id = $1', [req.params.id]);
+        await cliente.query('DELETE FROM transacciones WHERE id = $1 AND bodega_id = $2', [req.params.id, req.bodega.bodega_id]);
+        await cliente.query('COMMIT');
+        res.json({ mensaje: 'Movimiento borrado permanentemente' });
+    } catch (error) { await cliente.query('ROLLBACK'); res.status(500).json({ error: 'Error' }); }
+    finally { cliente.release(); }
 });
 
 const PORT = process.env.PORT || 3000;
